@@ -1,0 +1,176 @@
+name: Mobile E2E
+
+# PRs: static checks + API tests + Android/iOS smoke against the EAS build for the PR's commit.
+# Manual "regression" run: full suite before an App Store / Google Play release.
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: smoke (PR gate) or regression (release candidate)
+        type: choice
+        options: [smoke, regression]
+        default: regression
+      build_profile:
+        description: EAS build profile for Android (an APK build)
+        default: preview
+      ios_sim_profile:
+        description: EAS build profile for the iOS simulator build (ios.simulator = true)
+        default: preview-simulator
+
+concurrency:
+  group: mobile-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SUITE: ${{ inputs.suite || 'smoke' }}
+  BUILD_PROFILE: ${{ inputs.build_profile || 'preview' }}
+  IOS_SIM_PROFILE: ${{ inputs.ios_sim_profile || 'preview-simulator' }}
+  # On pull_request, github.sha is a temporary merge commit that EAS never built.
+  # EAS builds are tagged with the PR's HEAD commit, so match on that.
+  COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  # Shared test config (repo variables / secrets)
+  BFF_URL: ${{ vars.BFF_URL }}
+  E2E_USER: ${{ secrets.E2E_USER }}
+  E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+  E2E_API_TOKEN: ${{ secrets.E2E_API_TOKEN }}
+  E2E_API_TOKEN_2: ${{ secrets.E2E_API_TOKEN_2 }}
+  ANDROID_APP_PACKAGE: ${{ vars.ANDROID_APP_PACKAGE }}
+  IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+  APP_SCHEME: ${{ vars.APP_SCHEME }}
+
+jobs:
+  static:
+    name: Typecheck + no-sleep / no-XPath guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint:selectors
+
+  api:
+    name: API (GraphQL + REST)
+    needs: static
+    if: ${{ vars.BFF_URL != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run test:api
+
+  android:
+    name: Android ${{ inputs.suite || 'smoke' }} (emulator, API 34)
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      EXPO_PUSH_TOKEN_ANDROID: ${{ secrets.EXPO_PUSH_TOKEN_ANDROID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Find + download the EAS build for this commit
+        run: npm run build:find -- --platform android --profile "$BUILD_PROFILE" --commit "$COMMIT_SHA"
+
+      - name: Enable KVM (hardware acceleration for the emulator)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Cache Chromedriver downloads (Custom Tabs)
+        uses: actions/cache@v4
+        with:
+          path: .cache/chromedriver
+          key: chromedriver-${{ runner.os }}-api34
+
+      - name: Run on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          # google_apis (not google_apis_playstore): ships Chrome AND is debuggable,
+          # which the Chrome first-run override below needs.
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          # Each line runs as a separate shell command here, so no multi-line if/else.
+          # Lines 1-2 skip Chrome's first-run screens, which otherwise cover the Salesforce
+          # page inside the Custom Tab on a fresh emulator.
+          script: |
+            adb shell am set-debug-app --persistent com.android.chrome
+            adb shell 'echo "_ --disable-fre --no-default-browser-check --no-first-run" > /data/local/tmp/chrome-command-line'
+            npm run ${{ (inputs.suite || 'smoke') == 'smoke' && 'smoke:android' || 'test:android' }}
+
+      - name: Upload evidence (screenshots, video, logcat, build-info)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-evidence
+          path: |
+            artifacts/
+            reports/
+          retention-days: 14
+
+  ios:
+    name: iOS ${{ inputs.suite || 'smoke' }} (simulator)
+    needs: static
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      IOS_DEVICE_NAME: iPhone 16
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Find + download the EAS simulator build for this commit
+        run: npm run build:find -- --platform ios --profile "$IOS_SIM_PROFILE" --simulator --commit "$COMMIT_SHA"
+
+      - name: applesimutils (pre-grants notification permission on the simulator)
+        run: brew tap wix/brew && brew install applesimutils
+
+      - name: Cache WebDriverAgent build
+        uses: actions/cache@v4
+        with:
+          path: .cache/wda
+          key: wda-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Boot simulator
+        run: |
+          xcrun simctl boot "$IOS_DEVICE_NAME" || true
+          xcrun simctl bootstatus "$IOS_DEVICE_NAME" -b
+
+      - name: Run on simulator
+        run: npm run ${{ (inputs.suite || 'smoke') == 'smoke' && 'smoke:ios' || 'test:ios' }}
+
+      - name: Upload evidence (screenshots, video, syslog, build-info)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-evidence
+          path: |
+            artifacts/
+            reports/
+          retention-days: 14
+
+  # Release regression results -> AIO Tests: reports/junit/*.xml imports into the release's
+  # test cycle (AIO Tests' JUnit import). Case keys in the titles (PC-TC-xxx) map results 1:1.
