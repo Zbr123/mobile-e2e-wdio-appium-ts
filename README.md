@@ -80,6 +80,19 @@ Release  ─► workflow_dispatch suite=regression → full suite → JUnit → 
 
 If no EAS build exists for the PR's commit, the job tests the newest build for that profile and puts a **warning in the job summary**, so a pass against an older build can't be mistaken for a pass on this PR.
 
+### Repository settings the workflow needs
+
+Set these under **Settings → Secrets and variables → Actions** before the first run.
+
+| Kind | Name | Used for |
+|---|---|---|
+| Secret | `E2E_USER`, `E2E_PASSWORD` | Salesforce sandbox test user |
+| Secret | `E2E_API_TOKEN`, `E2E_API_TOKEN_2` | BFF tokens for two users (permission tests) |
+| Secret | `EXPO_TOKEN` | Finding and downloading the EAS build |
+| Secret | `EXPO_PUSH_TOKEN_ANDROID` | Sending a real push to the Android emulator |
+| Variable | `ANDROID_APP_PACKAGE`, `IOS_BUNDLE_ID`, `APP_SCHEME` | App under test |
+| Variable | `BFF_URL` | Staging BFF for API tests and test data |
+
 ## Versions
 
 WebdriverIO **9.x**, Appium **3.9**, UiAutomator2 driver **8.7.x**, XCUITest driver **12.22.x**, TypeScript 5.9, Node 20+.
